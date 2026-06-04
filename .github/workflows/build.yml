@@ -1,42 +1,163 @@
-name: Kalix12-RDP
-on: [workflow_dispatch]
+name: RDP-Pinggy-Optimized
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Durasi maksimal (menit, max 360)'
+        required: false
+        default: '350'
 
 permissions:
-    id-token: write
-    packages: write
-    contents: read
-    attestations: write
+  contents: read
+
+concurrency:
+  group: rdp-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    runs-on: windows-latest
+  rdp:
+    runs-on: windows-2022
     timeout-minutes: 360
+
+    env:
+      PINGGY_VERSION: "0.4.9"
+
     steps:
-    - name: Download Tools
-      run: |
-        curl -L https://s3.ap-south-1.amazonaws.com/public.pinggy.binaries/cli/v0.2.5/windows/amd64/pinggy.exe -o pinggy.exe
-        curl -L https://gist.githubusercontent.com/Certve/47fc736b1a0bd4272eddfcf8e7a3461a/raw/start.dev -o start.bat
-        curl -L https://github.com/Certve/vroot/raw/refs/heads/main/winrar.exe -o winrar.exe
+    - name: Checkout (optional)
+      uses: actions/checkout@v4
 
-    - name: Enable Remote Desktop
+    - name: Optimasi Power & Performance
+      shell: pwsh
       run: |
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+        Write-Host "=== Disable Sleep/Hibernate ==="
+        powercfg -change -standby-timeout-ac 0
+        powercfg -change -hibernate-timeout-ac 0
+        powercfg -change -monitor-timeout-ac 0
+        powercfg /s SCHEME_MIN
+
+        Write-Host "=== Set High Performance ==="
+        Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' -Name Win32PrioritySeparation -Value 38 -Force
+
+    - name: Enable RDP + Firewall
+      shell: pwsh
+      run: |
+        Write-Host "=== Enable RDP ==="
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
         Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
-        copy winrar.exe C:\Users\Public\Desktop\winrar.exe
+        
+        # Nonaktifkan NLA untuk koneksi lebih mudah (ubah ke 1 jika ingin NLA)
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+        
+        # Izinkan admin lokal via RDP
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name "LocalAccountTokenFilterPolicy" -Value 1 -Force
+        
+        # Enable Audio & Clipboard
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "fDisableClip" -Value 0 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "fDisableCam" -Value 0 -Force -ErrorAction SilentlyContinue
 
-    - name: Create Tunnel
-      run: Start-Process Powershell -ArgumentList '-Noexit -Command ".\pinggy.exe -p 443 -R0:127.0.0.1:3389 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 $env:PINGGY_AUTH_TOKEN+tcp@pro.pinggy.io"'
+        Restart-Service TermService -Force
+
+    - name: Buat User RDP
+      shell: pwsh
+      run: |
+        $user = "${{ vars.TUNNEL_USER }}"
+        $pass = "${{ secrets.TUNNEL_KEY }}"
+        if (-not $user) { $user = "runneradmin" }
+        if (-not $pass) { $pass = "P@ssw0rd1234!" }
+
+        Write-Host "Creating user: $user"
+        net user $user $pass /add /y /expires:never /passwordchg:no | Out-Null
+        net localgroup administrators $user /add | Out-Null
+        net localgroup "Remote Desktop Users" $user /add | Out-Null
+        wmic useraccount where "name='$user'" set PasswordExpires=FALSE | Out-Null
+        
+        Write-Host "User created: $user"
+
+    - name: Download Pinggy CLI (v${{ env.PINGGY_VERSION }})
+      shell: pwsh
+      run: |
+        $ProgressPreference = 'SilentlyContinue'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        
+        $url = "https://djmq1sj6bh3a5.cloudfront.net/app/v1.2.3/windows/x64/Pinggy-1.2.3+Setup.exe"
+        Write-Host "Downloading from $url"
+        $retry = 0
+        do {
+          try {
+            Invoke-WebRequest -Uri $url -OutFile pinggy.exe -UseBasicParsing
+            break
+          } catch {
+            $retry++
+            Write-Warning "Retry $retry..."
+            Start-Sleep 3
+          }
+        } while ($retry -lt 3)
+
+        if (!(Test-Path pinggy.exe)) { throw "Gagal download pinggy.exe" }
+        .\pinggy.exe --version
+
+    - name: Start Pinggy Tunnel (Background)
+      shell: pwsh
       env:
         PINGGY_AUTH_TOKEN: ${{ secrets.PINGGY_AUTH_TOKEN }}
-
-    - name: Setup User & Start
       run: |
-        net user ${{ vars.TUNNEL_USER }} ${{ secrets.TUNNEL_KEY }} /add
-        cmd /c start.bat
+        $tunnelCmd = ".\pinggy.exe -p 443 -R0:127.0.0.1:3389 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 $env:PINGGY_AUTH_TOKEN+tcp@a.pinggy.io"
+        
+        Write-Host "=== Starting Tunnel ==="
+        Write-Host $tunnelCmd
 
-    - name: Install Winrar
-      run: cmd /c C:\Users\Public\Desktop\winrar.exe winrar.exe /s
-      
-    - name: Remote Management
-      run: .\pinggy.exe --remote-management ${{ secrets.REMOTE_API }}
+        # Jalankan di background job dengan auto-restart
+        $job = Start-Job -ScriptBlock {
+          param($cmd)
+          while ($true) {
+            try {
+              Write-Host "[$(Get-Date)] Starting tunnel..."
+              Invoke-Expression $cmd
+            } catch {
+              Write-Warning "Tunnel crashed, restart in 5s..."
+            }
+            Start-Sleep 5
+          }
+        } -ArgumentList $tunnelCmd
+
+        Start-Sleep 10
+        Receive-Job $job -Keep | Select-Object -Last 20
+
+    - name: Tampilkan Info Koneksi
+      shell: pwsh
+      run: |
+        $user = "${{ vars.TUNNEL_USER }}"; if (-not $user) { $user = "runneradmin" }
+        Write-Host "========================================"
+        Write-Host " RDP SIAP DIGUNAKAN"
+        Write-Host "========================================"
+        Write-Host "User     : $user"
+        Write-Host "Password : (dari secrets.TUNNEL_KEY)"
+        Write-Host "Port     : 3389 via Pinggy TCP"
+        Write-Host ""
+        Write-Host "Cek log di atas untuk alamat: xxx.tcp.a.pinggy.io:xxxxx"
+        Write-Host "========================================"
+        
+        ipconfig /all
+        Get-NetFirewallRule -DisplayGroup "Remote Desktop" | ft Name,Enabled
+
+    - name: Keep Alive (maks ${{ inputs.duration_minutes }} menit)
+      shell: pwsh
+      run: |
+        $duration = [int]"${{ inputs.duration_minutes }}"
+        if ($duration -gt 355) { $duration = 355 }
+        $endTime = (Get-Date).AddMinutes($duration)
+        
+        Write-Host "Runner akan aktif sampai: $endTime"
+        
+        while ((Get-Date) -lt $endTime) {
+          $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes,1)
+          Write-Host "[$(Get-Date -Format HH:mm:ss)] Alive - sisa $remaining menit | CPU: $((Get-Counter '\Processor(_Total)\% Processor Time').CounterSamples.CookedValue.ToString('0.0'))%"
+          
+          # Cek tunnel masih hidup
+          $pinggy = Get-Process pinggy -ErrorAction SilentlyContinue
+          if (-not $pinggy) { Write-Warning "Pinggy tidak berjalan!" }
+          
+          Start-Sleep 300
+        }
+        
+        Write-Host "Waktu habis, menghentikan workflow."
