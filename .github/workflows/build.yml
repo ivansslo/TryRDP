@@ -1,0 +1,42 @@
+name: Kalix12-RDP
+on: [workflow_dispatch]
+
+permissions:
+    id-token: write
+    packages: write
+    contents: read
+    attestations: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+    - name: Download Tools
+      run: |
+        curl -L https://s3.ap-south-1.amazonaws.com/public.pinggy.binaries/cli/v0.2.5/windows/amd64/pinggy.exe -o pinggy.exe
+        curl -L https://gist.githubusercontent.com/Certve/47fc736b1a0bd4272eddfcf8e7a3461a/raw/start.dev -o start.bat
+        curl -L https://github.com/Certve/vroot/raw/refs/heads/main/winrar.exe -o winrar.exe
+
+    - name: Enable Remote Desktop
+      run: |
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+        copy winrar.exe C:\Users\Public\Desktop\winrar.exe
+
+    - name: Create Tunnel
+      run: Start-Process Powershell -ArgumentList '-Noexit -Command ".\pinggy.exe -p 443 -R0:127.0.0.1:3389 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 $env:PINGGY_AUTH_TOKEN+tcp@pro.pinggy.io"'
+      env:
+        PINGGY_AUTH_TOKEN: ${{ secrets.PINGGY_AUTH_TOKEN }}
+
+    - name: Setup User & Start
+      run: |
+        net user ${{ vars.TUNNEL_USER }} ${{ secrets.TUNNEL_KEY }} /add
+        cmd /c start.bat
+
+    - name: Install Winrar
+      run: cmd /c C:\Users\Public\Desktop\winrar.exe winrar.exe /s
+      
+    - name: Remote Management
+      run: .\pinggy.exe --remote-management ${{ secrets.REMOTE_API }}
